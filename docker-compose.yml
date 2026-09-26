@@ -1,0 +1,19 @@
+services:
+  page-turn-planner:
+    build: .
+    image: page-turn-planner:latest
+    container_name: page-turn-planner
+    ports:
+      - "8000:8000"
+    environment:
+      # 数据目录（SQLite 结果文件 plans.db 存放在该目录）
+      DATA_DIR: /data
+    volumes:
+      # 规划结果持久化到宿主机 ./data
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
