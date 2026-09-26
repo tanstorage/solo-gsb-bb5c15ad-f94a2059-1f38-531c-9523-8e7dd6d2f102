@@ -13,6 +13,22 @@
    演奏小节内按左右手忙碌区间求连续空闲窗，挑选能容纳完整翻页动作的最晚
    开始时刻（并列时优先左手）。
 
+精确时间轴（不使用浮点累加或 epsilon）
+========================================
+每小节拍数与速度（BPM）先按已校验数值的**十进制字面量**构造有理数
+（``Fraction(str(x))``），每小节时长 ``60 × 拍数 / 速度`` 与按重复段展开后
+各次发声的开始时刻、总时长都是精确有理数；定位时时间戳同样按十进制字面量
+转换。累计时长、区间归属与拍数偏移均据此精确计算：
+
+- 时间区间左闭右开，**只有恰等于边界才进入下一次发声**——两小节各 1 拍、
+  60 BPM（每小节恰 1 秒）时，``0.9999999995`` 严格小于边界 1，仍归第一小节
+  且拍偏移为精确的 ``0.9999999995``，不会被容差提前推入第二小节而产生
+  负拍偏移；
+- **严格早于总时长即可定位，等于或超过总时长才报错**——``1.9999999995``
+  严格小于总时长 2，正常定位到第二小节，不会被容差误判为越界。
+
+只有结果出口把有理数转回 float（响应仍为 JSON number），转换不参与任何判定。
+
 本模块仅依赖标准库，便于脱离 Web 层直接单测。
 """
 
@@ -21,15 +37,21 @@ from __future__ import annotations
 from bisect import bisect_right
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 from typing import List, Optional, Sequence, Tuple
 
 
-def _eps(magnitude: float) -> float:
-    """随数量级缩放的浮点容差，抹平前缀和累加与 JSON 浮点解析误差。
+def _decimal_fraction(value: float) -> Fraction:
+    """按已校验数值的十进制字面量构造精确有理数（调用方须已确保是有限数值）。"""
+    return Fraction(str(value))
 
-    仅用于由拍数/速度换算得到的时间轴计算量（其本身不是十进制精确值）；
-    用户直接输入的静默秒数与最低翻页时间比较走 :func:`_silence_sufficient`
-    的十进制精确口径，与规划核心一致。
+
+def _eps(magnitude: float) -> float:
+    """随数量级缩放的浮点容差，仅用于翻页空档的空闲窗容量判定。
+
+    时间轴本身（发声开始时刻、总时长、区间归属、拍偏移）一律走精确有理数，
+    不使用本容差；用户直接输入的静默秒数与最低翻页时间比较走
+    :func:`_silence_sufficient` 的十进制精确口径，与规划核心一致。
     """
     return 1e-9 * max(1.0, abs(magnitude))
 
@@ -346,50 +368,61 @@ def _latest_slot_start(
 
 @dataclass(frozen=True)
 class Rehearsal:
-    """一次排练定位的已校验上下文：演奏序列、前缀时间与分页映射。"""
+    """一次排练定位的已校验上下文：演奏序列、精确时间轴与分页映射。
+
+    ``start_times`` / ``total_duration`` 是精确有理数时间轴的 float 视图，
+    仅供响应出口使用；一切区间归属与边界判定只在 ``start_times_exact`` /
+    ``total_duration_exact`` / ``seconds_per_beat_exact`` 上进行。
+    """
 
     measure_count: int
     tempo_bpm: float
     beats_per_measure: Tuple[float, ...]  # 每个原谱小节的拍数（已校验为正）
     events: List[PlayedMeasure]
-    start_times: List[float]  # start_times[k]：第 k 个演奏事件的开始时间
-    total_duration: float
+    start_times: List[float]  # start_times[k]：第 k 个演奏事件开始时刻的 float 视图
+    total_duration: float  # 精确总时长的 float 视图
     page_starts: Tuple[int, ...]  # 每页起始原谱小节（0 基，升序，首个为 0）
+    # 精确有理数时间轴：按已校验数值的十进制字面量构造，判定只用它
+    start_times_exact: Tuple[Fraction, ...]  # 第 k 个演奏事件的精确开始时刻
+    total_duration_exact: Fraction  # 重复段展开后的精确累计总时长
+    seconds_per_beat_exact: Fraction  # 每拍秒数 60 / 速度（精确）
 
     def page_of(self, measure: int) -> int:
         """原谱小节号 -> 已存方案的 1 基页码。"""
         return bisect_right(self.page_starts, measure)
 
     def locate(self, timestamp: float) -> Location:
-        """定位单个时间戳；越界/为负时抛 RehearsalError。"""
-        total = self.total_duration
-        if timestamp < -_eps(total):
+        """定位单个时间戳；为负、达到或超过总时长时抛 RehearsalError。
+
+        全部判定在精确有理数时间轴上进行：时间戳按十进制字面量转换为有理数，
+        区间左闭右开——恰等于某次发声的起点才归该次发声，严格小于总时长
+        即可定位；拍数偏移同样按精确差值计算，仅在出口转回 float。
+        """
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            raise RehearsalError("时间戳必须是数值")
+        ts = float(timestamp)
+        if ts != ts or ts in (float("inf"), float("-inf")):
+            raise RehearsalError("时间戳必须是有限数值（不接受 NaN 或 Infinity）")
+        t = _decimal_fraction(ts)
+        if t < 0:
             raise RehearsalError(
-                f"时间戳 {timestamp:g} 秒不能为负数（时间戳以演奏开始为 0）"
+                f"时间戳 {ts} 秒不能为负数（时间戳以演奏开始为 0）"
             )
-        # 左闭右开：总时长处是最后一小节的右端点，不属于任何小节
-        if timestamp >= total - _eps(total):
+        total = self.total_duration_exact
+        # 左闭右开：总时长处是最后一次发声的右端点，不属于任何小节；
+        # 严格小于总时长都可定位，等于或超过才越界
+        if t >= total:
             raise RehearsalError(
-                f"时间戳 {timestamp:g} 秒超出演奏总时长 {total:g} 秒"
+                f"时间戳 {ts} 秒达到或超出演奏总时长 {float(total)} 秒"
                 "（定位采用左闭右开区间，端点总时长不可定位）"
             )
 
-        t = max(0.0, timestamp)  # 0 附近的负向舍入误差视为起点
-        # 恰在边界归下一小节：先按严格小于取段，再用容差吸收浮点累加误差
-        idx = bisect_right(self.start_times, t) - 1
-        while (
-            idx + 1 < len(self.events)
-            and self.start_times[idx + 1] <= t + _eps(self.start_times[idx + 1])
-        ):
-            idx += 1
-
+        # 恰在边界归下一次发声：精确二分，无任何容差
+        idx = bisect_right(self.start_times_exact, t) - 1
         event = self.events[idx]
-        seconds_per_beat = 60.0 / self.tempo_bpm
-        beat_offset = (t - self.start_times[idx]) / seconds_per_beat
-        # 消除浮点噪声与可能的 -0.0，拍数偏移保留 9 位小数
-        beat_offset = round(beat_offset, 9)
-        if beat_offset == 0:
-            beat_offset = 0.0
+        offset_exact = (t - self.start_times_exact[idx]) / self.seconds_per_beat_exact
+        # 精确差值非负，不会产生 -0.0；仅在出口转换为 float
+        beat_offset = float(offset_exact)
         return Location(
             measure=event.measure,
             playthrough=event.playthrough,
@@ -546,6 +579,9 @@ def prepare_rehearsal(
 ) -> Rehearsal:
     """校验输入并构建排练定位上下文。
 
+    时间轴按已校验数值的十进制字面量构造精确有理数：重复段展开后的累计
+    时长、各次发声开始时刻与每拍秒数均为精确值，定位判定不使用浮点容差。
+
     :param measure_count: 已存规划的原谱小节数
     :param beats_per_measure: 每小节拍数，长度必须等于 ``measure_count``、元素为正
     :param tempo_bpm: 每分钟拍数，必须为正
@@ -585,19 +621,29 @@ def prepare_rehearsal(
     # _normalize_repeats 在 expand_repeats 内完成；此处提前调用以先报错
     events = expand_repeats(measure_count, repeats)
 
-    seconds_per_beat = 60.0 / tempo
-    start_times: List[float] = []
-    elapsed = 0.0
+    # 精确有理数时间轴：拍数与速度按已校验数值的十进制字面量构造有理数，
+    # 每小节时长 = 60 × 拍数 / 速度，前缀和即各次发声的精确开始时刻；
+    # 重复段展开后的累计总时长同样精确，不做任何浮点累加
+    spb_exact = 60 / _decimal_fraction(tempo)
+    durations_exact = [
+        _decimal_fraction(float(b)) * spb_exact for b in beats_per_measure
+    ]
+    starts_exact: List[Fraction] = []
+    elapsed = Fraction(0)
     for event in events:
-        start_times.append(elapsed)
-        elapsed += float(beats_per_measure[event.measure]) * seconds_per_beat
+        starts_exact.append(elapsed)
+        elapsed += durations_exact[event.measure]
 
     return Rehearsal(
         measure_count=measure_count,
         tempo_bpm=tempo,
         beats_per_measure=tuple(float(b) for b in beats_per_measure),
         events=events,
-        start_times=start_times,
-        total_duration=elapsed,
+        # float 视图仅供响应出口使用；判定一律走下面的精确时间轴
+        start_times=[float(s) for s in starts_exact],
+        total_duration=float(elapsed),
         page_starts=page_tuple,
+        start_times_exact=tuple(starts_exact),
+        total_duration_exact=elapsed,
+        seconds_per_beat_exact=spb_exact,
     )

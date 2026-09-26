@@ -1115,6 +1115,9 @@ def locate_rehearsal_timestamps(
 
     依据提交的每小节拍数、速度与重复段，按谱面顺序展开实际演奏序列，
     以左闭右开区间把每个时间戳定位到原谱小节、重复遍号、拍数偏移和页码。
+    时间轴按已校验数值的十进制字面量构造精确有理数（不使用浮点累加或
+    epsilon）：只有恰在边界才归下一次发声，严格早于总时长即可定位，
+    等于或超过总时长返回 422。
     """
     assert store is not None
     record = store.get(plan_id)

@@ -178,6 +178,74 @@ def test_locate_at_or_beyond_total_duration_rejected():
         r.locate(-0.5)
 
 
+def test_locate_exact_timeline_decimal_boundaries():
+    # 两小节各 1 拍、60 BPM -> 每小节恰 1 秒，总时长恰 2 秒（精确有理数时间轴）
+    r = prepare_rehearsal(2, [1, 1], 60, [], [0])
+    assert r.total_duration == 2.0
+
+    # 严格小于边界 1：仍归第一小节，拍偏移为精确的 0.9999999995，
+    # 不得被容差提前推入第二小节而产生负拍偏移
+    loc = r.locate(0.9999999995)
+    assert (loc.measure, loc.beat_offset) == (0, 0.9999999995)
+
+    # 只有恰在边界才进入下一小节
+    loc = r.locate(1.0)
+    assert (loc.measure, loc.beat_offset) == (1, 0.0)
+
+    # 严格小于总时长：正常定位到第二小节，不得误判越界
+    loc = r.locate(1.9999999995)
+    assert (loc.measure, loc.beat_offset) == (1, 0.9999999995)
+
+    # 等于或超过总时长才拒绝
+    with pytest.raises(RehearsalError, match="超出演奏总时长"):
+        r.locate(2.0)
+    with pytest.raises(RehearsalError, match="超出演奏总时长"):
+        r.locate(2.0000000001)
+    # 任何负值都拒绝（不再有负向容差）
+    with pytest.raises(RehearsalError, match="不能为负数"):
+        r.locate(-1e-12)
+
+
+def test_locate_exact_cumulative_duration_decimal():
+    # 0.1 秒小节 ×3：精确累计总时长恰为 0.3（不是浮点的 0.30000000000000004），
+    # 0.3 本身等于总时长不可定位，严格早于它的 0.2999999999 可以
+    r = prepare_rehearsal(3, [0.1, 0.1, 0.1], 60, [], [0])
+    assert r.total_duration == pytest.approx(0.3)
+    loc = r.locate(0.2999999999)
+    assert (loc.measure, loc.beat_offset) == (2, 0.0999999999)
+    with pytest.raises(RehearsalError, match="超出演奏总时长"):
+        r.locate(0.3)
+
+
+def test_locate_exact_timeline_with_repeat_jumpback_and_mixed_beats():
+    # 长短小节混排 + 重复回跳：小节 0 为 1 拍、小节 1 为 3 拍，60 BPM
+    # -> 小节时长 1 秒、3 秒；重复段 [0..1] 两遍
+    # 演奏序列：0(1s) 1(3s) 0(1s) 1(3s)，精确开始时刻 0, 1, 4, 5，总时长 8
+    r = prepare_rehearsal(2, [1, 3], 60, [(0, 1, 2)], [0, 1])
+    assert r.start_times == [0.0, 1.0, 4.0, 5.0]
+    assert r.total_duration == 8.0
+
+    cases = {
+        0.9999999999: (0, 1, 0.9999999999, 1),
+        1.0: (1, 1, 0.0, 2),             # 恰在边界归下一小节
+        3.9999999999: (1, 1, 2.9999999999, 2),
+        4.0: (0, 2, 0.0, 1),             # 重复回跳到小节 0 第二遍
+        4.9999999999: (0, 2, 0.9999999999, 1),
+        5.0: (1, 2, 0.0, 2),
+        7.9999999999: (1, 2, 2.9999999999, 2),
+    }
+    for ts, (m, play, beat, page) in cases.items():
+        loc = r.locate(ts)
+        assert (loc.measure, loc.playthrough, loc.beat_offset, loc.page_index) == (
+            m, play, beat, page
+        ), f"ts={ts}"
+
+    # 严格早于总时长可定位，等于总时长拒绝
+    assert r.locate(7.9999999999).measure == 1
+    with pytest.raises(RehearsalError, match="超出演奏总时长"):
+        r.locate(8.0)
+
+
 def test_locate_float_total_duration_boundary():
     # 180/70 为非整小数；恰好等于计算出的总时长仍不可定位
     r = prepare_rehearsal(1, [3], 70, [], [0])

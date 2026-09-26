@@ -153,6 +153,80 @@ def test_locate_timestamp_beyond_total(client):
         assert "超出演奏总时长" in resp.json()["detail"]
 
 
+def test_locate_exact_decimal_boundaries(client):
+    """每小节恰 1 秒：边界判定走精确有理数时间轴，不用浮点容差。"""
+    plan_id = _create_plan(client)
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/locate",
+        json={
+            "beats_per_measure": [1, 1, 1, 1],
+            "tempo_bpm": 60,  # 每小节恰 1 秒，总时长恰 4 秒
+            "timestamps": [0.9999999995, 1, 1.9999999995, 3.9999999995],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total_duration"] == 4.0
+    assert body["locations"] == [
+        # 严格小于边界 1：仍归第一小节，拍偏移精确、不为负
+        {"measure": 0, "playthrough": 1, "beat_offset": 0.9999999995, "page_index": 1},
+        # 恰在边界才进入下一小节
+        {"measure": 1, "playthrough": 1, "beat_offset": 0.0, "page_index": 1},
+        # 严格小于总时长：正常定位，不误判越界
+        {"measure": 1, "playthrough": 1, "beat_offset": 0.9999999995, "page_index": 1},
+        {"measure": 3, "playthrough": 1, "beat_offset": 0.9999999995, "page_index": 2},
+    ]
+
+    # 等于或超过总时长：422
+    for bad_ts in (4.0, 4.0000000001):
+        resp = client.post(
+            f"/api/v1/plans/{plan_id}/rehearsal/locate",
+            json={
+                "beats_per_measure": [1, 1, 1, 1],
+                "tempo_bpm": 60,
+                "timestamps": [bad_ts],
+            },
+        )
+        assert resp.status_code == 422
+        assert "超出演奏总时长" in resp.json()["detail"]
+
+
+def test_locate_repeat_jumpback_mixed_beats(client):
+    """重复回跳 + 长短小节混排：精确累计时长、区间归属与拍偏移。"""
+    plan_id = _create_plan(client)
+    # 小节 0: 1 拍(1s)，小节 1: 3 拍(3s)，小节 2/3: 4 拍(4s)；
+    # 重复段 [0..1] 两遍 -> 序列 0,1,0,1,2,3，开始时刻 0,1,4,5,8,12，总时长 16
+    payload = {
+        "beats_per_measure": [1, 3, 4, 4],
+        "tempo_bpm": 60,
+        "repeats": [{"start_measure": 0, "end_measure": 1, "play_count": 2}],
+    }
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/locate",
+        json={**payload, "timestamps": [3.9999999999, 4, 4.9999999999, 8, 15.9999999999]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total_duration"] == 16.0
+    assert body["locations"] == [
+        {"measure": 1, "playthrough": 1, "beat_offset": 2.9999999999, "page_index": 1},
+        # 恰在边界：回跳到小节 0 的第二遍
+        {"measure": 0, "playthrough": 2, "beat_offset": 0.0, "page_index": 1},
+        {"measure": 0, "playthrough": 2, "beat_offset": 0.9999999999, "page_index": 1},
+        {"measure": 2, "playthrough": 1, "beat_offset": 0.0, "page_index": 2},
+        # 严格早于总时长 16 秒：可定位
+        {"measure": 3, "playthrough": 1, "beat_offset": 3.9999999999, "page_index": 2},
+    ]
+
+    # 恰等于总时长 16 秒：422
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/locate",
+        json={**payload, "timestamps": [16]},
+    )
+    assert resp.status_code == 422
+    assert "超出演奏总时长" in resp.json()["detail"]
+
+
 def test_locate_rejects_basic_validation_errors(client):
     plan_id = _create_plan(client)
     base = {
