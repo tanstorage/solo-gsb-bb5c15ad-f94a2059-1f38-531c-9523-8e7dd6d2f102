@@ -190,6 +190,57 @@ def test_locate_float_total_duration_boundary():
     assert loc.beat_offset > 0
 
 
+def test_locate_exact_timeline_near_measure_boundary():
+    # 两小节各 1 拍、60 BPM -> 每小节 1 秒、总时长 2 秒（精确有理数时间轴）
+    r = prepare_rehearsal(2, [1, 1], 60, [], [0])
+    assert r.total_duration == 2.0
+    # 严格早于边界 1 秒：仍归第一小节，拍偏移不为负
+    loc = r.locate(0.9999999995)
+    assert (loc.measure, loc.playthrough) == (0, 1)
+    assert loc.beat_offset == pytest.approx(0.9999999995)
+    assert loc.beat_offset >= 0
+    # 恰到边界才进入第二小节
+    loc = r.locate(1.0)
+    assert (loc.measure, loc.beat_offset) == (1, 0.0)
+    # 严格早于总时长仍可定位
+    loc = r.locate(1.9999999995)
+    assert (loc.measure, loc.playthrough) == (1, 1)
+    assert loc.beat_offset == pytest.approx(0.9999999995)
+    # 等于或超过总时长：拒绝
+    for bad in (2.0, 2.0000000001):
+        with pytest.raises(RehearsalError, match="超出演奏总时长"):
+            r.locate(bad)
+
+
+def test_locate_exact_timeline_with_repeat_jump_and_mixed_beats():
+    # 长短小节混排 + 重复回跳：1 拍、2 拍小节交替，60 BPM -> 每拍 1 秒
+    # 演奏序列：0(1秒) 1(2秒) 0遍2(1秒) 1遍2(2秒) 2(1秒)，起点 0/1/3/4/6，总时长 7 秒
+    r = prepare_rehearsal(3, [1, 2, 1], 60, [(0, 1, 2)], [0, 2])
+    assert r.total_duration == 7.0
+    assert r.start_times == [0.0, 1.0, 3.0, 4.0, 6.0]
+    # 回跳边界：严格早于 3 秒仍归小节 1 遍 1，恰到 3 秒归小节 0 遍 2
+    loc = r.locate(2.9999999999)
+    assert (loc.measure, loc.playthrough) == (1, 1)
+    assert loc.beat_offset == pytest.approx(1.9999999999)
+    loc = r.locate(3.0)
+    assert (loc.measure, loc.playthrough, loc.beat_offset) == (0, 2, 0.0)
+    # 页码映射保持原谱分页：小节 2 在第 2 页
+    loc = r.locate(6.9999999999)
+    assert (loc.measure, loc.page_index) == (2, 2)
+    assert loc.beat_offset == pytest.approx(0.9999999999)
+    with pytest.raises(RehearsalError, match="超出演奏总时长"):
+        r.locate(7.0)
+
+
+def test_locate_rejects_non_finite_and_negative_timestamps():
+    r = prepare_rehearsal(2, [1, 1], 60, [], [0])
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(RehearsalError, match="有限数值"):
+            r.locate(bad)
+    with pytest.raises(RehearsalError, match="不能为负数"):
+        r.locate(-0.0000000001)  # 任何负值（含极小负值）都拒绝，无容差钳回
+
+
 def test_locate_all_preserves_order_and_reports_index():
     r = _rehearsal()
     locs = r.locate_all([0.0, 2.0, 10.0])

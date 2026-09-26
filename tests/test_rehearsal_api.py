@@ -153,6 +153,53 @@ def test_locate_timestamp_beyond_total(client):
         assert "超出演奏总时长" in resp.json()["detail"]
 
 
+def test_locate_exact_timeline_near_boundaries(client):
+    """两小节各 1 拍、60 BPM：精确有理数时间轴下的边界归属。
+
+    0.9999999995 秒仍归第一小节（不得提前归入第二小节产生负拍偏移），
+    1.9999999995 秒严格早于总时长 2 秒仍可定位，2.0 秒返回 422。
+    """
+    resp = client.post(
+        "/api/v1/plans",
+        json={
+            "measure_heights": [1, 1],
+            "silence_seconds": [1, 0],
+            "page_height": 2,
+            "min_turn_time": 1,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    plan_id = resp.json()["id"]
+
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/locate",
+        json={
+            "beats_per_measure": [1, 1],
+            "tempo_bpm": 60,
+            "timestamps": [0.9999999995, 1.0, 1.9999999995],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total_duration"] == 2.0
+    assert body["locations"] == [
+        {"measure": 0, "playthrough": 1, "beat_offset": 0.9999999995, "page_index": 1},
+        {"measure": 1, "playthrough": 1, "beat_offset": 0.0, "page_index": 1},
+        {"measure": 1, "playthrough": 1, "beat_offset": 0.9999999995, "page_index": 1},
+    ]
+
+    resp = client.post(
+        f"/api/v1/plans/{plan_id}/rehearsal/locate",
+        json={
+            "beats_per_measure": [1, 1],
+            "tempo_bpm": 60,
+            "timestamps": [2.0],
+        },
+    )
+    assert resp.status_code == 422
+    assert "超出演奏总时长" in resp.json()["detail"]
+
+
 def test_locate_rejects_basic_validation_errors(client):
     plan_id = _create_plan(client)
     base = {
